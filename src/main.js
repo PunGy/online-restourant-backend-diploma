@@ -2,6 +2,7 @@ require('dotenv').config()
 const RestLib = require('rest-library')
 const { parseBodyMiddleware } = require('rest-library/utils')
 const fs = require('fs')
+const { stat } = require('fs/promises')
 const crypto = require('crypto')
 
 const busboy = require('busboy')
@@ -13,6 +14,7 @@ const parseCookieMiddleware = require('./middleware/parseCookie.js')
 const onlyAuthenticatedMiddleware = require('./middleware/onlyAuthenticated.js')
 const authenticateMiddleware = require('./middleware/authenticate.js')
 const sessionMiddleware = require('./middleware/session.js')
+const { deleteSession, updateSession } = require('./database/sessions')
 
 const parseFormDataBody = (ctx, next) => new Promise((resolve) => {
     const { request } = ctx
@@ -39,6 +41,20 @@ const parseFormDataBody = (ctx, next) => new Promise((resolve) => {
 })
 
 const app = new RestLib()
+
+app.use((ctx, next) => {
+    ctx.response.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000')
+    ctx.response.setHeader('Access-Control-Allow-Credentials', 'true')
+    ctx.response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    ctx.response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, PUT')
+    next()
+})
+
+app.notFound((ctx) => {
+    ctx.response.setHeader('Access-Control-Allow-Origin', '*')
+    ctx.response.status = 404
+    ctx.response.send({error: 'Not found'})
+})
 
 app.error((ctx, error) => {
     console.error(error)
@@ -71,7 +87,7 @@ app.use(authenticateMiddleware)
  function userBodyValidation (ctx, next) {
     const { body } = ctx.request
 
-    if (body.username == null || body.password == null) {
+    if (body.email == null || body.password == null) {
         ctx.response.send({
             error: 'Invalid body',
         }, 400)
@@ -85,17 +101,17 @@ app.post('/registration', userBodyValidation, async (ctx) => {
     const db = await connect()
 
     const user = await addUser(db, ctx.userBody)
-    ctx.session.userId = user.id
+    await updateSession(db, ctx.session.id, { userId: user.id })
 
     ctx.response.send(user)
 })
 
 app.post('/login', userBodyValidation, async (ctx) => {
     const db = await connect()
-    const user = await getUserByCredentials(db, ctx.userBody.username, ctx.userBody.password)
+    const user = await getUserByCredentials(db, ctx.userBody.email, ctx.userBody.password)
 
     if (user) {
-        ctx.session.userId = user.id
+        await updateSession(db, ctx.session.id, { userId: user.id })
         ctx.response.send(user)
     } else {
         ctx.response.send({
@@ -104,21 +120,41 @@ app.post('/login', userBodyValidation, async (ctx) => {
     }
 })
 
-app.post('/logout', (ctx) => {
-    delete ctx.session.userId
+app.post('/logout', async (ctx) => {
+    deleteSession(db, ctx.session.id)
     ctx.response.send({
         message: 'Logout successful',
     })
 })
 
-app.get('/user', onlyAuthenticatedMiddleware, (ctx) => {
+app.get('/users/current', onlyAuthenticatedMiddleware, (ctx) => {
     ctx.response.send(ctx.user)
 })
 
 /** IMAGES */
 
-app.get('/images/:id', (ctx) => {})
-app.post('/images', parseFormDataBody)
+app.get('/images/:id', async (ctx) => {
+    const db = await connect()
+    const { id } = ctx.request.params
+    const image = (await db.query('SELECT * FROM images WHERE id = $1', [id])).rows[0]
+
+    if (image) {
+        const path = `./images/${id}.${image.type}`
+        const imageStats = await stat(path).catch(() => null)
+
+        if (imageStats) {
+            ctx.response.writeHead(200, {
+                'Content-Type': `image/${image.type}`,
+                'Content-Size': imageStats.size
+            })
+            const readImage = fs.createReadStream(path)
+
+            //readImage.pipe(process.stdout)
+            readImage.pipe(ctx.response)
+        }
+    }
+
+})
 
 /** PRODUCTS */
 
@@ -158,7 +194,7 @@ app.all('/order/*', onlyAuthenticatedMiddleware)
 app.get('/order', async (ctx) => {
     const db = await connect()
 
-    const order = (await db.query('SELECT * FROM orders WHERE user_id = $1', [ctx.user.id])).rows[0]
+    const order = (await db.query('SELECT * FROM orders WHERE customer_id = $1', [ctx.user.id])).rows[0]
     if (order) {
         ctx.response.send(order)
     } else {
@@ -168,29 +204,35 @@ app.get('/order', async (ctx) => {
 app.post('/order', async (ctx) => {
     const db = await connect()
 
-    const order = (await db.query('INSERT INTO orders (user_id, products) VALUES ($1, \'\') RETURNING *', [ctx.user.id])).rows[0]
+    let order = (await db.query('SELECT products FROM orders WHERE customer_id = $1', [ctx.user.id])).rows[0]
+    if (order == null) {
+        order = (await db.query('INSERT INTO orders (customer_id, products, status) VALUES ($1, $2, $3) RETURNING *', [ctx.user.id, ctx.request.body, 'active'])).rows[0]
+    } else {
+        const products = { ...order.products, ...ctx.request.body }
+        order = (await db.query('UPDATE orders SET products = $1 WHERE customer_id = $2 RETURNING *', [JSON.stringify(products), ctx.user.id])).rows[0]
+    }    
 
     ctx.response.send(order)
 })
 app.put('/order', async (ctx) => {
     const db = await connect()
 
-    const { products } = ctx.request.body
+    const order = (await db.query('SELECT products FROM orders WHERE customer_id = $1', [ctx.user.id])).rows[0]
+    const products = { ...ctx.request.body, ...(order?.products ?? {}) }
+    await db.query('UPDATE orders SET products = $1 WHERE customer_id = $2', [JSON.stringify(products), ctx.user.id])
 
-    await db.query('UPDATE orders SET products = $1 WHERE user_id = $2', [products, ctx.user.id])
-
-    ctx.response.send({ status: 'done' })
+    ctx.response.send({ products })
 })
 app.delete('/order', async (ctx) => {
     const db = await connect()
 
-    await db.query('DELETE FROM orders WHERE user_id = $1', [ctx.user.id])
+    await db.query('DELETE FROM orders WHERE customer_id = $1', [ctx.user.id])
 
     ctx.response.send({ status: 'done' })
 })
 
 /**  **/
 
-app.listen(3000, () => {
-    console.log('Server started on port 3000')
+app.listen(3001, () => {
+    console.log('Server started on port 3001')
 })

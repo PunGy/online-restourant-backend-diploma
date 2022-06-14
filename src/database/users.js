@@ -2,25 +2,25 @@ const { DatabaseError } = require('pg/lib')
 const { getRowsToUpdate } = require('../helpers/database.js')
 
 const getUser = async (db, userId) => {
-    const r = await db.query('SELECT username, id FROM users WHERE id = $1', [userId])
+    const r = await db.query('SELECT email, full_name, id FROM users WHERE id = $1', [userId])
     
     return r.rows[0]
 }
 
 const getUsers = async (db) => {
-    const r = await db.query('SELECT id, username FROM users')
+    const r = await db.query('SELECT id, full_name, email FROM users')
     
     return r.rows
 }
 
 const addUser = async (db, user) => {
-    const r = await db.query('INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username', [user.username, user.password])
+    const r = await db.query('INSERT INTO users (email, full_name, password) VALUES ($1, $2, $3) RETURNING id, email', [user.email, user.full_name, user.password])
 
     return r.rows[0]
 }
 
 const deleteUser = async (db, userId) => {
-    const r = await db.query('DELETE FROM users WHERE id = $1 RETURNING id, username', [userId])
+    const r = await db.query('DELETE FROM users WHERE id = $1 RETURNING id, email', [userId])
 
     return r.rows[0]
 }
@@ -29,7 +29,7 @@ const updateUser = async (db, userId, userData) => {
     const rowsToUpdate = getRowsToUpdate(postData)
 
     const r = await db.query(
-        `UPDATE users SET ${rowsToUpdate.join(', ')} WHERE id = $${rowsToUpdate.length + 1} RETURNING id, username`,
+        `UPDATE users SET ${rowsToUpdate.join(', ')} WHERE id = $${rowsToUpdate.length + 1} RETURNING id, email`,
         Object.values(userData).concat(userId),
     )
 
@@ -37,7 +37,7 @@ const updateUser = async (db, userId, userData) => {
 }
 
 const getUserByCredentials = async (db, login, password) => {
-    const r = await db.query('SELECT id, username FROM users WHERE username = $1 AND password = $2', [login, password])
+    const r = await db.query('SELECT id, email, full_name FROM users WHERE email = $1 AND password = $2', [login, password])
 
     return r.rows[0]
 }
