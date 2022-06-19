@@ -10,6 +10,8 @@ const busboy = require('busboy')
 const connect = require('./database/connect')
 const { addUser, getUserByCredentials } = require('./database/users.js')
 
+const { getRowsToUpdate } = require('./helpers/database')
+
 const parseCookieMiddleware = require('./middleware/parseCookie.js')
 const onlyAuthenticatedMiddleware = require('./middleware/onlyAuthenticated.js')
 const authenticateMiddleware = require('./middleware/authenticate.js')
@@ -43,10 +45,10 @@ const parseFormDataBody = (ctx, next) => new Promise((resolve) => {
 const app = new RestLib()
 
 app.use((ctx, next) => {
-    ctx.response.setHeader('Access-Control-Allow-Origin', 'http://localhost:3000')
+    ctx.response.setHeader('Access-Control-Allow-Origin', process.env.CLIENT_DOMAIN)
     ctx.response.setHeader('Access-Control-Allow-Credentials', 'true')
     ctx.response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-    ctx.response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, PUT')
+    ctx.response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, PUT, PATCH')
     next()
 })
 
@@ -65,6 +67,8 @@ app.error((ctx, error) => {
 })
 
 app.use(parseBodyMiddleware)
+
+// Logger
 app.use((ctx, next) => {
     console.log(`${ctx.request.method}: ${ctx.request.url}`)
     if (ctx.request.body != null) {
@@ -75,6 +79,7 @@ app.use((ctx, next) => {
 
     next()
 })
+
 app.use(parseCookieMiddleware)
 app.use(sessionMiddleware)
 app.use(authenticateMiddleware)
@@ -100,6 +105,8 @@ app.use(authenticateMiddleware)
 app.post('/registration', userBodyValidation, async (ctx) => {
     const db = await connect()
 
+    if (ctx.userBody.email === 'admin@example.com')
+        ctx.userBody.role = 'admin'
     const user = await addUser(db, ctx.userBody)
     await updateSession(db, ctx.session.id, { userId: user.id })
 
@@ -121,7 +128,9 @@ app.post('/login', userBodyValidation, async (ctx) => {
 })
 
 app.post('/logout', async (ctx) => {
-    deleteSession(db, ctx.session.id)
+    const db = await connect()
+
+    await deleteSession(db, ctx.session.id)
     ctx.response.send({
         message: 'Logout successful',
     })
@@ -183,7 +192,7 @@ app.post('/products', parseFormDataBody, async (ctx) => {
     const db = await connect()
 
     const product = ctx.request.body
-    await db.query(`INSERT INTO images (id, title, type) VALUES ($1, $2, $3) RETURNING id`, [product.image.filename, product.image.info.filename, product.image.info.filetype])
+    await db.query(`INSERT INTO images (id, title, type) VALUES ($1, $2, $3) RETURNING id`, [product.image.filename, product.image.info.filename, product.image.filetype])
     await db.query(`INSERT INTO products (title, description, price, image) VALUES ($1, $2, $3, $4)`, [product.title.value, product.description.value, +product.price.value, product.image.filename])
     ctx.response.send({ status: 'done' })
 })
@@ -194,7 +203,7 @@ app.all('/order/*', onlyAuthenticatedMiddleware)
 app.get('/order', async (ctx) => {
     const db = await connect()
 
-    const order = (await db.query('SELECT * FROM orders WHERE customer_id = $1', [ctx.user.id])).rows[0]
+    const order = (await db.query('SELECT * FROM orders WHERE customer_id = $1 and status = \'pending\'', [ctx.user.id])).rows[0]
     if (order) {
         ctx.response.send(order)
     } else {
@@ -204,31 +213,21 @@ app.get('/order', async (ctx) => {
 app.post('/order', async (ctx) => {
     const db = await connect()
 
-    let order = (await db.query('SELECT products FROM orders WHERE customer_id = $1', [ctx.user.id])).rows[0]
-    if (order == null) {
-        order = (await db.query('INSERT INTO orders (customer_id, products, status) VALUES ($1, $2, $3) RETURNING *', [ctx.user.id, ctx.request.body, 'active'])).rows[0]
-    } else {
-        const products = { ...order.products, ...ctx.request.body }
-        order = (await db.query('UPDATE orders SET products = $1 WHERE customer_id = $2 RETURNING *', [JSON.stringify(products), ctx.user.id])).rows[0]
-    }    
+    const order = (await (db.query(`INSERT INTO orders (customer_id, status, products) VALUES ($1, $2, $3) RETURNING *`, [ctx.user.id, 'pending', JSON.stringify(ctx.request.body.products)]))).rows[0]
 
     ctx.response.send(order)
 })
-app.put('/order', async (ctx) => {
+app.patch('/order/:orderId', async (ctx) => {
     const db = await connect()
+    const rowsToUpdate = getRowsToUpdate(ctx.request.body)
 
-    const order = (await db.query('SELECT products FROM orders WHERE customer_id = $1', [ctx.user.id])).rows[0]
-    const products = { ...ctx.request.body, ...(order?.products ?? {}) }
-    await db.query('UPDATE orders SET products = $1 WHERE customer_id = $2', [JSON.stringify(products), ctx.user.id])
+    const order = (await db.query(`UPDATE orders SET ${rowsToUpdate} WHERE id = $${rowsToUpdate.length + 1} RETURNING *`, Object.values(ctx.request.body).map(
+        val => typeof val === 'object' 
+            ? JSON.stringify(val) 
+            : val
+    ).concat(ctx.request.params.orderId))).rows[0]
 
-    ctx.response.send({ products })
-})
-app.delete('/order', async (ctx) => {
-    const db = await connect()
-
-    await db.query('DELETE FROM orders WHERE customer_id = $1', [ctx.user.id])
-
-    ctx.response.send({ status: 'done' })
+    ctx.response.send(order)
 })
 
 /**  **/
